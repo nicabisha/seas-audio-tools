@@ -21,7 +21,8 @@ keywords = [
     "deduplication",
     "audio-fingerprint",
     "chromaprint",
-    "tkinter",
+    "qt",
+    "pyside6",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -44,7 +45,7 @@ dependencies = [
     "Pillow>=10",
     "numpy>=2.0",
     "tqdm>=4.66",
-    "tkinterdnd2>=0.4",
+    "PySide6>=6.6",
 ]
 
 [project.optional-dependencies]

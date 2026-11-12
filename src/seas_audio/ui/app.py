@@ -1,24 +1,52 @@
-"""Drag-and-drop window for the Seas audio tools.
+"""Drag-and-drop window for the Seas audio tools (Qt/PySide6 port).
 
-One window, two tabs. Both tabs share a ``DropZone`` that accepts files *and*
-folders from Explorer and hands back real absolute paths, which is the whole
-reason this is Tkinter + tkdnd rather than a webview.
+One window, two tabs. Each tab exposes a :class:`DropZone` that accepts files
+*and* folders from Explorer and hands back real absolute paths, which is the
+whole reason this is a native toolkit rather than a webview.
 
-Long work runs on a worker thread and talks to the UI only through a queue, so
-no Tk widget is ever touched off the main thread.
+Long work runs on a :class:`QThread` and talks to the UI only through Qt
+signals, so no widget is ever touched off the main thread. Compared with the
+Tk version this redraws smoothly on resize (hardware-accelerated rendering)
+and has no manual ``after()`` polling loop - Qt's queued signal delivery does
+that job.
+
+The ``core`` and ``tools`` packages are reused unchanged.
 """
 
 from __future__ import annotations
 
 import csv
 import os
-import queue
 import subprocess
 import sys
 import threading
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from seas_audio import __version__
 from seas_audio.core.cache import FingerprintCache
@@ -35,27 +63,22 @@ from seas_audio.core.library import build_library
 from seas_audio.core.scanner import collect_audio_files
 from seas_audio.tools import duplicates, sanitizer
 
-try:  # tkdnd ships compiled Tcl binaries, so treat it as optional.
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    DND_AVAILABLE = True
-except Exception:  # pragma: no cover - depends on the local environment
-    DND_FILES = None
-    TkinterDnD = None
-    DND_AVAILABLE = False
-
-QUEUE_POLL_MS = 60
 MAX_LOG_LINES = 3000
 
 COLOUR_DROP = "#f4f7fb"
 COLOUR_DROP_ACTIVE = "#dbe9ff"
 COLOUR_BORDER = "#b8c4d6"
+COLOUR_BORDER_ACTIVE = "#4a86e8"
 COLOUR_TEXT = "#22303f"
 COLOUR_MUTED = "#5a6b7d"
 COLOUR_ERROR = "#b3261e"
 COLOUR_OK = "#1b6b35"
 
-_RootBase = TkinterDnD.Tk if DND_AVAILABLE else tk.Tk
+_LEVEL_COLOURS = {
+    "error": COLOUR_ERROR,
+    "ok": COLOUR_OK,
+    "muted": COLOUR_MUTED,
+}
 
 
 def _asset(name: str) -> Path | None:
@@ -92,125 +115,101 @@ def _reveal_in_explorer(path: str) -> None:
         pass
 
 
-class LogPane(ttk.Frame):
-    """Read-only scrolling log with colour tags."""
+class LogPane(QTextEdit):
+    """Read-only scrolling log with colour-coded lines."""
 
-    def __init__(self, master: tk.Misc, height: int = 12) -> None:
-        super().__init__(master)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        self._text = tk.Text(
-            self,
-            height=height,
-            wrap="word",
-            state="disabled",
-            background="#fbfcfd",
-            foreground=COLOUR_TEXT,
-            relief="flat",
-            padx=8,
-            pady=6,
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setAcceptRichText(False)
+        self.setStyleSheet(
+            f"background: #fbfcfd; color: {COLOUR_TEXT}; border: 1px solid {COLOUR_BORDER};"
         )
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._text.yview)
-        self._text.configure(yscrollcommand=scrollbar.set)
-        self._text.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
 
-        self._text.tag_configure("error", foreground=COLOUR_ERROR)
-        self._text.tag_configure("ok", foreground=COLOUR_OK)
-        self._text.tag_configure("muted", foreground=COLOUR_MUTED)
-
-    def append(self, message: str, tag: str | None = None) -> None:
-        self._text.configure(state="normal")
-        self._text.insert("end", message + "\n", (tag,) if tag else ())
-        lines = int(self._text.index("end-1c").split(".")[0])
-        if lines > MAX_LOG_LINES:
-            self._text.delete("1.0", str(lines - MAX_LOG_LINES) + ".0")
-        self._text.see("end")
-        self._text.configure(state="disabled")
+    def append(self, message: str, level: str | None = None) -> None:
+        self.setTextColor(QColor(_LEVEL_COLOURS.get(level or "", COLOUR_TEXT)))
+        super().append(message)
+        self.setTextColor(QColor(COLOUR_TEXT))
+        self._trim()
 
     def clear(self) -> None:
-        self._text.configure(state="normal")
-        self._text.delete("1.0", "end")
-        self._text.configure(state="disabled")
+        super().clear()
+
+    def _trim(self) -> None:
+        document = self.document()
+        while document.blockCount() > MAX_LOG_LINES:
+            from PySide6.QtGui import QTextCursor
+
+            block = document.firstBlock()
+            cursor = QTextCursor(block)
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
 
 
-class DropZone(ttk.Frame):
+class DropZone(QWidget):
     """A target that accepts dropped files and folders and keeps their paths."""
 
     def __init__(
         self,
-        master: tk.Misc,
         title: str,
         *,
         hint: str = "",
-        height: int = 6,
-        on_change=None,
+        parent: QWidget | None = None,
     ) -> None:
-        super().__init__(master)
-        self.columnconfigure(0, weight=1)
+        super().__init__(parent)
         self._paths: list[Path] = []
-        self._on_change = on_change
         self._enabled = True
 
-        ttk.Label(self, text=title, font=("Segoe UI", 9, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(0, 4)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(title_label)
+
+        self._target = QLabel("Drop files or folders here")
+        self._target.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._target.setMinimumHeight(56)
+        self._target.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._paint(active=False)
+        layout.addWidget(self._target)
+
+        self._listbox = QListWidget()
+        self._listbox.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self._listbox, 1)
+
+        buttons = QWidget()
+        row = QHBoxLayout(buttons)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.browse_button = QPushButton("Browse...")
+        self.remove_button = QPushButton("Remove selected")
+        self.clear_button = QPushButton("Clear")
+        self.browse_button.clicked.connect(self.browse)
+        self.remove_button.clicked.connect(self.remove_selected)
+        self.clear_button.clicked.connect(self.clear)
+        row.addWidget(self.browse_button)
+        row.addWidget(self.remove_button)
+        row.addWidget(self.clear_button)
+        row.addStretch(1)
+        layout.addWidget(buttons)
+
+        self._hint = QLabel(hint)
+        self._hint.setStyleSheet(f"color: {COLOUR_MUTED};")
+        layout.addWidget(self._hint)
+
+        self.setAcceptDrops(True)
+        self._refresh()
+
+    def _paint(self, *, active: bool) -> None:
+        background = COLOUR_DROP_ACTIVE if active else COLOUR_DROP
+        border = COLOUR_BORDER_ACTIVE if active else COLOUR_BORDER
+        self._target.setStyleSheet(
+            f"background: {background}; color: {COLOUR_MUTED};"
+            f" border: 1px solid {border}; padding: 12px;"
         )
-
-        self._target = tk.Label(
-            self,
-            text=(
-                "Drop files or folders here"
-                if DND_AVAILABLE
-                else "Drag and drop unavailable - use Browse..."
-            ),
-            background=COLOUR_DROP,
-            foreground=COLOUR_MUTED,
-            relief="solid",
-            borderwidth=1,
-            highlightthickness=1,
-            highlightbackground=COLOUR_BORDER,
-            padx=12,
-            pady=18,
-            cursor="hand2",
-        )
-        self._target.grid(row=1, column=0, sticky="ew")
-        self._target.bind("<Button-1>", lambda _event: self.browse())
-
-        self._listbox = tk.Listbox(
-            self,
-            height=height,
-            selectmode="extended",
-            activestyle="none",
-            background="#ffffff",
-            foreground=COLOUR_TEXT,
-            relief="solid",
-            borderwidth=1,
-            highlightthickness=0,
-        )
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._listbox.yview)
-        self._listbox.configure(yscrollcommand=scrollbar.set)
-        self._listbox.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        scrollbar.grid(row=2, column=1, sticky="ns", pady=(6, 0))
-        self.rowconfigure(2, weight=1)
-
-        buttons = ttk.Frame(self)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(buttons, text="Browse...", command=self.browse).pack(side="left")
-        ttk.Button(buttons, text="Remove selected", command=self.remove_selected).pack(
-            side="left", padx=(6, 0)
-        )
-        ttk.Button(buttons, text="Clear", command=self.clear).pack(side="left", padx=(6, 0))
-
-        self._hint = ttk.Label(self, text=hint, foreground=COLOUR_MUTED)
-        self._hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        if DND_AVAILABLE:
-            for widget in (self._target, self._listbox):
-                widget.drop_target_register(DND_FILES)
-                widget.dnd_bind("<<Drop>>", self._on_drop)
-                widget.dnd_bind("<<DropEnter>>", self._on_drag_enter)
-                widget.dnd_bind("<<DropLeave>>", self._on_drag_leave)
 
     @property
     def paths(self) -> list[Path]:
@@ -232,7 +231,6 @@ class DropZone(ttk.Frame):
             added += 1
         if added:
             self._refresh()
-            self._notify()
         return added
 
     def clear(self) -> None:
@@ -240,382 +238,409 @@ class DropZone(ttk.Frame):
             return
         self._paths.clear()
         self._refresh()
-        self._notify()
 
     def remove_selected(self) -> None:
-        selection = set(self._listbox.curselection())
-        if not selection:
+        rows = sorted({index.row() for index in self._listbox.selectedIndexes()}, reverse=True)
+        if not rows:
             return
-        self._paths = [
-            path for index, path in enumerate(self._paths) if index not in selection
-        ]
+        for row in rows:
+            del self._paths[row]
         self._refresh()
-        self._notify()
 
     def browse(self) -> None:
         if not self._enabled:
             return
-        chosen = filedialog.askdirectory(title="Choose a music folder")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose a music folder")
         if chosen:
             self.add_paths([chosen])
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
-        self._target.configure(cursor="hand2" if enabled else "arrow")
-
-    def _refresh(self) -> None:
-        self._listbox.delete(0, "end")
-        for path in self._paths:
-            suffix = "\\" if path.is_dir() else ""
-            self._listbox.insert("end", f"{path}{suffix}")
-        if not self._paths:
-            self._hint.configure(text="Nothing queued yet.")
-        else:
-            self._hint.configure(text=f"{len(self._paths)} path(s) queued.")
-
-    def _notify(self) -> None:
-        if self._on_change is not None:
-            self._on_change()
-
-    def _on_drop(self, event):
-        raw = getattr(event, "data", "") or ""
-        try:
-            # tkdnd hands back a raw Tcl list; splitlist keeps spaced paths intact.
-            parts = self.tk.splitlist(raw)
-        except Exception:
-            parts = [raw]
-        self.add_paths(parts)
-        self._paint(active=False)
-
-    def _on_drag_enter(self, _event):
-        self._paint(active=True)
-
-    def _on_drag_leave(self, _event):
-        self._paint(active=False)
-
-    def _paint(self, *, active: bool) -> None:
-        self._target.configure(
-            background=COLOUR_DROP_ACTIVE if active else COLOUR_DROP,
-            highlightbackground="#4a86e8" if active else COLOUR_BORDER,
+        self.browse_button.setEnabled(enabled)
+        self.remove_button.setEnabled(enabled)
+        self.clear_button.setEnabled(enabled)
+        self._listbox.setEnabled(enabled)
+        self._target.setCursor(
+            Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor
         )
 
+    def _refresh(self) -> None:
+        self._listbox.clear()
+        for path in self._paths:
+            suffix = "\\" if path.is_dir() else ""
+            self._listbox.addItem(f"{path}{suffix}")
+        if not self._paths:
+            self._hint.setText("Nothing queued yet.")
+        else:
+            self._hint.setText(f"{len(self._paths)} path(s) queued.")
 
-class JobFrame(ttk.Frame):
-    """Frame that runs one background job and receives queued events."""
+    def dragEnterEvent(self, event) -> None:
+        if self._enabled and (event.mimeData().hasUrls() or event.mimeData().hasText()):
+            event.acceptProposedAction()
+            self._paint(active=True)
+        else:
+            event.ignore()
 
-    def __init__(self, master: tk.Misc, app: "App") -> None:
-        super().__init__(master, padding=10)
-        self.app = app
-        self._events: queue.Queue = queue.Queue()
-        self._cancel = threading.Event()
-        self._running = False
+    def dragLeaveEvent(self, event) -> None:
+        self._paint(active=False)
+        super().dragLeaveEvent(event)
 
-    def start_job(self, target) -> None:
-        if self._running:
+    def dropEvent(self, event) -> None:
+        self._paint(active=False)
+        if not self._enabled:
+            event.ignore()
             return
-        self._running = True
-        self._cancel.clear()
-        self.on_job_start()
-        threading.Thread(target=self._run_guarded, args=(target,), daemon=True).start()
-        self.after(QUEUE_POLL_MS, self._poll)
+        paths: list[str] = []
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                local = url.toLocalFile()
+                if local:
+                    paths.append(local)
+        elif event.mimeData().hasText():
+            for part in event.mimeData().text().splitlines():
+                part = part.strip().strip('"')
+                if part:
+                    paths.append(part)
+        if paths:
+            self.add_paths(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
-    def _run_guarded(self, target) -> None:
+
+class JobThread(QThread):
+    """Run one worker function off the UI thread, relaying events via signals."""
+
+    log = Signal(str, str)          # message, level
+    progress = Signal(int, int, str)  # done, total, current name (may be "")
+    phase = Signal(str)
+    results = Signal(object)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, fn, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+        self._cancel = threading.Event()
+
+    def run(self) -> None:
         try:
-            target()
+            self._fn(self)
         except FpcalcNotFoundError as exc:
-            self._emit("error", f"fpcalc is missing.\n{exc}")
+            self.failed.emit(f"fpcalc is missing.\n{exc}")
         except Exception as exc:  # keep the window alive whatever happens
-            self._emit("error", f"{type(exc).__name__}: {exc}")
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
         finally:
-            self._emit("finished")
-
-    def _emit(self, kind: str, *payload) -> None:
-        self._events.put((kind, payload))
-
-    def _poll(self) -> None:
-        while True:
-            try:
-                kind, payload = self._events.get_nowait()
-            except queue.Empty:
-                break
-            if kind == "finished":
-                self._running = False
-                self.on_job_finish()
-                return
-            self.handle_event(kind, *payload)
-        if self._running:
-            self.after(QUEUE_POLL_MS, self._poll)
+            self.done.emit()
 
     def request_cancel(self) -> None:
         self._cancel.set()
-        self.on_cancel_requested()
 
-    @property
-    def cancelled(self) -> bool:
+    def is_cancelled(self) -> bool:
         return self._cancel.is_set()
 
+
+class JobTab(QWidget):
+    """A tab that runs one background job at a time."""
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app)
+        self.app = app
+        self._thread: JobThread | None = None
+
+    def start_job(self, fn) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            return
+        thread = JobThread(fn, self)
+        thread.log.connect(self._handle_log)
+        thread.progress.connect(self._handle_progress)
+        thread.phase.connect(self._handle_phase)
+        thread.results.connect(self._handle_results)
+        thread.failed.connect(self._handle_error)
+        thread.done.connect(self._handle_done)
+        self._thread = thread
+        self.on_job_start()
+        thread.start()
+
+    def request_cancel(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.request_cancel()
+        self.on_cancel_requested()
+
+    def shutdown(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.request_cancel()
+            self._thread.wait(1500)
+
+    # --- hooks (overridden per tab) ---
     def on_job_start(self) -> None: ...
-
     def on_job_finish(self) -> None: ...
-
     def on_cancel_requested(self) -> None: ...
 
-    def handle_event(self, kind: str, *payload) -> None: ...
+    def _handle_log(self, message: str, level: str) -> None: ...
+    def _handle_progress(self, done: int, total: int, name: str) -> None: ...
+    def _handle_phase(self, text: str) -> None: ...
+    def _handle_results(self, payload) -> None: ...
+
+    def _handle_error(self, message: str) -> None:
+        QMessageBox.critical(self, APP_TITLE, message)
+
+    def _handle_done(self) -> None:
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.deleteLater()
+        self.on_job_finish()
 
 
-class SanitizeTab(JobFrame):
+class SanitizeTab(JobTab):
     """Drop a folder, fix the tags."""
 
-    def __init__(self, master: tk.Misc, app: "App") -> None:
-        super().__init__(master, app)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+    def __init__(self, app: "App") -> None:
+        super().__init__(app)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
-        self.drop = DropZone(
-            self,
-            "Files or folders to sanitize",
-            hint="MP3 files only. Other audio formats are skipped.",
-        )
-        self.drop.grid(row=0, column=0, sticky="nsew")
+        self.drop = DropZone("Files or folders to sanitize", hint="MP3 files only. Other audio formats are skipped.")
+        layout.addWidget(self.drop, 1)
 
-        options = ttk.LabelFrame(self, text="Options", padding=8)
-        options.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.dry_run = tk.BooleanVar(value=False)
-        self.backup = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            options, text="Dry run (report only, change nothing)", variable=self.dry_run
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
-            options, text="Keep a .bak copy before writing", variable=self.backup
-        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+        options = QGroupBox("Options")
+        opt_row = QHBoxLayout(options)
+        self.dry_run = QCheckBox("Dry run (report only, change nothing)")
+        self.backup = QCheckBox("Keep a .bak copy before writing")
+        opt_row.addWidget(self.dry_run)
+        opt_row.addWidget(self.backup)
+        opt_row.addStretch(1)
+        layout.addWidget(options)
 
-        controls = ttk.Frame(self)
-        controls.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        self.run_button = ttk.Button(controls, text="Sanitize", command=self.run)
-        self.run_button.pack(side="left")
-        self.cancel_button = ttk.Button(
-            controls, text="Cancel", command=self.request_cancel, state="disabled"
-        )
-        self.cancel_button.pack(side="left", padx=(6, 0))
-        self.progress = ttk.Progressbar(controls, maximum=100, value=0)
-        self.progress.pack(side="left", fill="x", expand=True, padx=(12, 0))
-        self.progress_label = ttk.Label(controls, text="idle", foreground=COLOUR_MUTED)
-        self.progress_label.pack(side="left", padx=(10, 0))
+        controls = QWidget()
+        ctrl = QHBoxLayout(controls)
+        ctrl.setContentsMargins(0, 0, 0, 0)
+        ctrl.setSpacing(6)
+        self.run_button = QPushButton("Sanitize")
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress_label = QLabel("idle")
+        self.progress_label.setStyleSheet(f"color: {COLOUR_MUTED};")
+        self.run_button.clicked.connect(self.run)
+        self.cancel_button.clicked.connect(self.request_cancel)
+        ctrl.addWidget(self.run_button)
+        ctrl.addWidget(self.cancel_button)
+        ctrl.addWidget(self.progress, 1)
+        ctrl.addWidget(self.progress_label)
+        layout.addWidget(controls)
 
-        self.log = LogPane(self, height=14)
-        self.log.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.log = LogPane()
+        layout.addWidget(self.log, 2)
 
     def run(self) -> None:
         if not self.drop.paths:
-            messagebox.showinfo(APP_TITLE, "Drop a file or folder first.")
+            QMessageBox.information(self, APP_TITLE, "Drop a file or folder first.")
             return
         self.log.clear()
-        self.start_job(self._work)
+        dry_run = self.dry_run.isChecked()
+        backup = self.backup.isChecked()
+        self.start_job(lambda job: self._work(job, dry_run, backup))
 
-    def _work(self) -> None:
+    def _work(self, job: JobThread, dry_run: bool, backup: bool) -> None:
         targets = self.drop.paths
-        self._emit("log", f"Scanning {len(targets)} target(s)...")
+        job.log.emit(f"Scanning {len(targets)} target(s)...", "normal")
 
         def warn(message: str) -> None:
-            self._emit("log", message, "muted")
+            job.log.emit(message, "muted")
 
         files = collect_audio_files(targets, warn=warn)
         if not files:
-            self._emit("log", "No supported audio files found.", "error")
+            job.log.emit("No supported audio files found.", "error")
             return
 
-        self._emit("log", f"Found {len(files)} audio file(s).")
+        job.log.emit(f"Found {len(files)} audio file(s).", "normal")
         results = sanitizer.sanitize_many(
             files,
-            dry_run=self.dry_run.get(),
-            backup=self.backup.get(),
-            on_progress=lambda done, total, name: self._emit("progress", done, total, name),
-            should_cancel=lambda: self.cancelled,
+            dry_run=dry_run,
+            backup=backup,
+            on_progress=lambda done, total, name: job.progress.emit(done, total, name),
+            should_cancel=job.is_cancelled,
         )
 
         counts: dict[str, int] = {}
         for result in results:
             counts[result.status] = counts.get(result.status, 0) + 1
             if result.status == sanitizer.STATUS_ERROR:
-                self._emit("log", f"error  {result.path.name}: {result.message}", "error")
+                job.log.emit(f"error  {result.path.name}: {result.message}", "error")
             elif result.status == sanitizer.STATUS_SKIPPED:
                 continue
             elif result.status == sanitizer.STATUS_CLEAN:
-                self._emit("log", f"clean  {result.path.name}", "muted")
+                job.log.emit(f"clean  {result.path.name}", "muted")
             else:
-                self._emit(
-                    "log", f"{result.status}  {result.path.name}: {result.message}", "ok"
-                )
+                job.log.emit(f"{result.status}  {result.path.name}: {result.message}", "ok")
 
-        if self.cancelled:
-            self._emit("log", "Cancelled - stopped early.", "error")
-        self._emit(
-            "log",
+        if job.is_cancelled():
+            job.log.emit("Cancelled - stopped early.", "error")
+        job.log.emit(
             "Summary: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())),
             "ok",
         )
-        if self.dry_run.get():
-            self._emit("log", "Dry run - no files were modified.", "muted")
+        if dry_run:
+            job.log.emit("Dry run - no files were modified.", "muted")
 
     def on_job_start(self) -> None:
-        self.run_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
+        self.run_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
         self.drop.set_enabled(False)
-        self.progress.configure(value=0)
-        self.progress_label.configure(text="starting...")
+        self.progress.setValue(0)
+        self.progress_label.setText("starting...")
 
     def on_job_finish(self) -> None:
-        self.run_button.configure(state="normal")
-        self.cancel_button.configure(state="disabled")
+        self.run_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
         self.drop.set_enabled(True)
-        self.progress_label.configure(text="finished")
+        self.progress_label.setText("finished")
         self.app.refresh_status()
 
     def on_cancel_requested(self) -> None:
-        self.progress_label.configure(text="cancelling...")
+        self.progress_label.setText("cancelling...")
 
-    def handle_event(self, kind: str, *payload) -> None:
-        if kind == "log":
-            message = payload[0]
-            tag = payload[1] if len(payload) > 1 else None
-            self.log.append(message, tag)
-        elif kind == "progress":
-            done, total, name = payload
-            self.progress.configure(value=(done / total * 100) if total else 0)
-            self.progress_label.configure(text=f"{done:,}/{total:,}  {name}"[:64])
-        elif kind == "error":
-            self.log.append(payload[0], "error")
-            messagebox.showerror(APP_TITLE, payload[0])
+    def _handle_log(self, message: str, level: str) -> None:
+        self.log.append(message, level)
+
+    def _handle_progress(self, done: int, total: int, name: str) -> None:
+        self.progress.setValue(int(done / total * 100) if total else 0)
+        text = f"{done:,}/{total:,}  {name}"[:64] if name else f"{done:,}/{total:,}"
+        self.progress_label.setText(text)
 
 
-class DuplicatesTab(JobFrame):
+class DuplicatesTab(JobTab):
     """Drop a library, find the near-duplicates."""
 
-    def __init__(self, master: tk.Misc, app: "App") -> None:
-        super().__init__(master, app)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(4, weight=1)
+    def __init__(self, app: "App") -> None:
+        super().__init__(app)
         self._pairs: list[duplicates.DuplicatePair] = []
 
-        zones = ttk.Frame(self)
-        zones.grid(row=0, column=0, sticky="nsew")
-        zones.columnconfigure(0, weight=1)
-        zones.columnconfigure(1, weight=1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
-        self.primary = DropZone(
-            zones,
-            "Library / batch to scan",
-            hint="Fingerprints are cached, so repeat runs are fast.",
-            height=5,
-        )
-        self.primary.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        zones = QWidget()
+        zones_row = QHBoxLayout(zones)
+        zones_row.setContentsMargins(0, 0, 0, 0)
+        zones_row.setSpacing(6)
+        self.primary = DropZone("Library / batch to scan", hint="Fingerprints are cached, so repeat runs are fast.")
+        self.reference = DropZone("Reference library (optional)", hint="Leave empty to scan the batch against itself.")
+        zones_row.addWidget(self.primary, 1)
+        zones_row.addWidget(self.reference, 1)
+        layout.addWidget(zones, 1)
 
-        self.reference = DropZone(
-            zones,
-            "Reference library (optional)",
-            hint="Leave empty to scan the batch against itself.",
-            height=5,
-        )
-        self.reference.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        tuning = QGroupBox("Matching")
+        tune = QHBoxLayout(tuning)
+        self.threshold = QDoubleSpinBox()
+        self.threshold.setRange(0.5, 1.0)
+        self.threshold.setSingleStep(0.01)
+        self.threshold.setDecimals(2)
+        self.threshold.setValue(DEFAULT_SIMILARITY_THRESHOLD)
+        self.tolerance = QSpinBox()
+        self.tolerance.setRange(0, 120)
+        self.tolerance.setValue(int(DEFAULT_DURATION_TOLERANCE))
+        self.max_offset = QSpinBox()
+        self.max_offset.setRange(0, 500)
+        self.max_offset.setSingleStep(10)
+        self.max_offset.setValue(DEFAULT_MAX_OFFSET_FRAMES)
+        self.use_cache = QCheckBox("Use fingerprint cache")
+        self.use_cache.setChecked(True)
+        tune.addWidget(QLabel("Similarity threshold"))
+        tune.addWidget(self.threshold)
+        tune.addWidget(QLabel("Duration window (s)"))
+        tune.addWidget(self.tolerance)
+        tune.addWidget(QLabel("Offset search"))
+        tune.addWidget(self.max_offset)
+        tune.addWidget(self.use_cache)
+        tune.addStretch(1)
+        layout.addWidget(tuning)
 
-        tuning = ttk.LabelFrame(self, text="Matching", padding=8)
-        tuning.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        controls = QWidget()
+        ctrl = QHBoxLayout(controls)
+        ctrl.setContentsMargins(0, 0, 0, 0)
+        ctrl.setSpacing(6)
+        self.run_button = QPushButton("Find duplicates")
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.export_button = QPushButton("Export CSV...")
+        self.export_button.setEnabled(False)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress_label = QLabel("idle")
+        self.progress_label.setStyleSheet(f"color: {COLOUR_MUTED};")
+        self.run_button.clicked.connect(self.run)
+        self.cancel_button.clicked.connect(self.request_cancel)
+        self.export_button.clicked.connect(self.export_csv)
+        ctrl.addWidget(self.run_button)
+        ctrl.addWidget(self.cancel_button)
+        ctrl.addWidget(self.export_button)
+        ctrl.addWidget(self.progress, 1)
+        ctrl.addWidget(self.progress_label)
+        layout.addWidget(controls)
 
-        self.threshold = tk.DoubleVar(value=DEFAULT_SIMILARITY_THRESHOLD)
-        self.tolerance = tk.DoubleVar(value=DEFAULT_DURATION_TOLERANCE)
-        self.max_offset = tk.IntVar(value=DEFAULT_MAX_OFFSET_FRAMES)
-        self.use_cache = tk.BooleanVar(value=True)
+        self.results = QTableWidget(0, 5)
+        self.results.setHorizontalHeaderLabels(["Match", "Scanned file", "kbps", "Matches", "kbps"])
+        header = self.results.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.results.setAlternatingRowColors(True)
+        self.results.verticalHeader().setVisible(False)
+        self.results.cellDoubleClicked.connect(self._reveal_selected)
+        layout.addWidget(self.results, 2)
 
-        ttk.Label(tuning, text="Similarity threshold").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(
-            tuning,
-            from_=0.5,
-            to=1.0,
-            increment=0.01,
-            width=6,
-            textvariable=self.threshold,
-            format="%.2f",
-        ).grid(row=0, column=1, sticky="w", padx=(6, 18))
-
-        ttk.Label(tuning, text="Duration window (s)").grid(row=0, column=2, sticky="w")
-        ttk.Spinbox(
-            tuning, from_=0, to=120, increment=1, width=6, textvariable=self.tolerance
-        ).grid(row=0, column=3, sticky="w", padx=(6, 18))
-
-        ttk.Label(tuning, text="Offset search").grid(row=0, column=4, sticky="w")
-        ttk.Spinbox(
-            tuning, from_=0, to=500, increment=10, width=6, textvariable=self.max_offset
-        ).grid(row=0, column=5, sticky="w", padx=(6, 18))
-
-        ttk.Checkbutton(
-            tuning, text="Use fingerprint cache", variable=self.use_cache
-        ).grid(row=0, column=6, sticky="w")
-
-        controls = ttk.Frame(self)
-        controls.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        self.run_button = ttk.Button(controls, text="Find duplicates", command=self.run)
-        self.run_button.pack(side="left")
-        self.cancel_button = ttk.Button(
-            controls, text="Cancel", command=self.request_cancel, state="disabled"
-        )
-        self.cancel_button.pack(side="left", padx=(6, 0))
-        self.export_button = ttk.Button(
-            controls, text="Export CSV...", command=self.export_csv, state="disabled"
-        )
-        self.export_button.pack(side="left", padx=(6, 0))
-        self.progress = ttk.Progressbar(controls, maximum=100, value=0)
-        self.progress.pack(side="left", fill="x", expand=True, padx=(12, 0))
-        self.progress_label = ttk.Label(controls, text="idle", foreground=COLOUR_MUTED)
-        self.progress_label.pack(side="left", padx=(10, 0))
-
-        self.results = ttk.Treeview(
-            self,
-            columns=("similarity", "file_a", "kbps_a", "file_b", "kbps_b"),
-            show="headings",
-            height=8,
-        )
-        for column, heading, width, anchor in (
-            ("similarity", "Match", 70, "center"),
-            ("file_a", "Scanned file", 300, "w"),
-            ("kbps_a", "kbps", 60, "center"),
-            ("file_b", "Matches", 300, "w"),
-            ("kbps_b", "kbps", 60, "center"),
-        ):
-            self.results.heading(column, text=heading)
-            self.results.column(column, width=width, anchor=anchor)
-        result_scroll = ttk.Scrollbar(self, orient="vertical", command=self.results.yview)
-        self.results.configure(yscrollcommand=result_scroll.set)
-        self.results.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
-        result_scroll.grid(row=3, column=1, sticky="ns", pady=(10, 0))
-        self.results.bind("<Double-1>", self._reveal_selected)
-
-        self.log = LogPane(self, height=7)
-        self.log.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        self.log = LogPane()
+        layout.addWidget(self.log, 1)
 
     def run(self) -> None:
         if not self.primary.paths:
-            messagebox.showinfo(APP_TITLE, "Drop the library or batch you want to scan.")
+            QMessageBox.information(self, APP_TITLE, "Drop the library or batch you want to scan.")
             return
         self.log.clear()
-        self.results.delete(*self.results.get_children())
+        self.results.setRowCount(0)
         self._pairs = []
-        self.export_button.configure(state="disabled")
-        self.start_job(self._work)
+        self.export_button.setEnabled(False)
+        threshold = self.threshold.value()
+        tolerance = self.tolerance.value()
+        max_offset = self.max_offset.value()
+        use_cache = self.use_cache.isChecked()
+        self.start_job(lambda job: self._work(job, threshold, tolerance, max_offset, use_cache))
 
-    def _work(self) -> None:
+    def _work(
+        self,
+        job: JobThread,
+        threshold: float,
+        tolerance: int,
+        max_offset: int,
+        use_cache: bool,
+    ) -> None:
         paths = self.app.paths
         cache = FingerprintCache(paths.fingerprint_cache)
         skip = [paths.quarantine_dir]
 
         def warn(message: str) -> None:
-            self._emit("log", message, "muted")
+            job.log.emit(message, "muted")
 
-        self._emit("phase", "Scanning folders...")
+        job.phase.emit("Scanning folders...")
         primary_files = collect_audio_files(self.primary.paths, skip_dirs=skip, warn=warn)
         if not primary_files:
-            self._emit("log", "No supported audio files in the scanned paths.", "error")
+            job.log.emit("No supported audio files in the scanned paths.", "error")
             return
-        self._emit("log", f"Primary set: {len(primary_files)} file(s).")
+        job.log.emit(f"Primary set: {len(primary_files)} file(s).", "normal")
 
         reference_files = (
             collect_audio_files(self.reference.paths, skip_dirs=skip, warn=warn)
@@ -623,89 +648,84 @@ class DuplicatesTab(JobFrame):
             else []
         )
         if reference_files:
-            self._emit("log", f"Reference set: {len(reference_files)} file(s).")
+            job.log.emit(f"Reference set: {len(reference_files)} file(s).", "normal")
 
-        self._emit("phase", "Fingerprinting primary...")
+        job.phase.emit("Fingerprinting primary...")
         primary_build = build_library(
             primary_files,
             cache,
-            use_cache=self.use_cache.get(),
-            on_progress=lambda done, total: self._emit("progress", done, total),
-            should_cancel=lambda: self.cancelled,
+            use_cache=use_cache,
+            on_progress=lambda done, total: job.progress.emit(done, total, ""),
+            should_cancel=job.is_cancelled,
         )
         if primary_build.cache_note:
-            self._emit("log", primary_build.cache_note, "muted")
+            job.log.emit(primary_build.cache_note, "muted")
         if primary_build.added:
-            self._emit("log", f"Fingerprinted {primary_build.added} new file(s).")
+            job.log.emit(f"Fingerprinted {primary_build.added} new file(s).", "normal")
         else:
-            self._emit("log", "All primary fingerprints came from the cache.", "ok")
+            job.log.emit("All primary fingerprints came from the cache.", "ok")
         for path, reason in primary_build.failures:
-            self._emit("log", f"unreadable  {Path(path).name}: {reason}", "error")
+            job.log.emit(f"unreadable  {Path(path).name}: {reason}", "error")
 
-        if self.cancelled:
+        if job.is_cancelled():
             return
 
-        reference_build = None
+        reference_records = None
         if reference_files:
-            self._emit("phase", "Fingerprinting reference...")
+            job.phase.emit("Fingerprinting reference...")
             reference_build = build_library(
                 reference_files,
                 cache,
-                use_cache=self.use_cache.get(),
-                on_progress=lambda done, total: self._emit("progress", done, total),
-                should_cancel=lambda: self.cancelled,
+                use_cache=use_cache,
+                on_progress=lambda done, total: job.progress.emit(done, total, ""),
+                should_cancel=job.is_cancelled,
             )
             for path, reason in reference_build.failures:
-                self._emit("log", f"unreadable  {Path(path).name}: {reason}", "error")
+                job.log.emit(f"unreadable  {Path(path).name}: {reason}", "error")
+            reference_records = reference_build.records
 
-        if self.cancelled:
+        if job.is_cancelled():
             return
 
         params = duplicates.SimilarityParams(
-            duration_tolerance=float(self.tolerance.get()),
-            threshold=float(self.threshold.get()),
-            max_offset_frames=int(self.max_offset.get()),
+            duration_tolerance=float(tolerance),
+            threshold=threshold,
+            max_offset_frames=max_offset,
         )
-        reference_records = reference_build.records if reference_build else None
         total = duplicates.count_candidate_pairs(
             primary_build.records, reference_records, params.duration_tolerance
         )
-        self._emit("log", f"Comparing {total:,} candidate pair(s).")
-        self._emit("phase", "Comparing fingerprints...")
+        job.log.emit(f"Comparing {total:,} candidate pair(s).", "normal")
+        job.phase.emit("Comparing fingerprints...")
 
         pairs = duplicates.find_duplicates(
             primary_build.records,
             reference_records,
             params,
-            on_progress=lambda done, total_pairs: self._emit("progress", done, total_pairs),
-            should_cancel=lambda: self.cancelled,
+            on_progress=lambda done, total_pairs: job.progress.emit(done, total_pairs, ""),
+            should_cancel=job.is_cancelled,
         )
 
-        if self.cancelled:
-            self._emit("log", "Cancelled - partial results discarded.", "error")
+        if job.is_cancelled():
+            job.log.emit("Cancelled - partial results discarded.", "error")
             return
         if not pairs:
-            self._emit("log", "No duplicates above the threshold.", "ok")
+            job.log.emit("No duplicates above the threshold.", "ok")
             return
 
-        self._emit("results", pairs)
-        self._emit("log", f"Found {len(pairs)} duplicate pair(s).", "ok")
-        self._emit(
-            "log",
-            "Double-click a row to reveal the file. Export writes the full report.",
-            "muted",
-        )
+        job.results.emit(pairs)
+        job.log.emit(f"Found {len(pairs)} duplicate pair(s).", "ok")
+        job.log.emit("Double-click a row to reveal the file. Export writes the full report.", "muted")
 
     def export_csv(self) -> None:
         if not self._pairs:
             return
         default = self.app.paths.report_path("duplicate_report.csv")
-        target = filedialog.asksaveasfilename(
-            title="Save duplicate report",
-            defaultextension=".csv",
-            initialdir=str(default.parent),
-            initialfile=default.name,
-            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")],
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save duplicate report",
+            str(default),
+            "CSV file (*.csv);;All files (*.*)",
         )
         if not target:
             return
@@ -717,77 +737,62 @@ class DuplicatesTab(JobFrame):
                 for pair in self._pairs:
                     writer.writerow(pair.as_row())
         except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"Could not write report: {exc}")
+            QMessageBox.critical(self, APP_TITLE, f"Could not write report: {exc}")
             return
         self.log.append(f"Report written to {target}", "ok")
 
-    def _reveal_selected(self, _event=None) -> None:
-        selection = self.results.selection()
-        if not selection:
-            return
+    def _reveal_selected(self, row: int, _column: int) -> None:
         try:
-            pair = self._pairs[int(selection[0])]
-        except (ValueError, IndexError):
+            pair = self._pairs[row]
+        except (IndexError, KeyError):
             return
         _reveal_in_explorer(pair.path_a)
 
     def on_job_start(self) -> None:
-        self.run_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
+        self.run_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
         self.primary.set_enabled(False)
         self.reference.set_enabled(False)
-        self.progress.configure(value=0)
-        self.progress_label.configure(text="starting...")
+        self.progress.setValue(0)
+        self.progress_label.setText("starting...")
 
     def on_job_finish(self) -> None:
-        self.run_button.configure(state="normal")
-        self.cancel_button.configure(state="disabled")
+        self.run_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
         self.primary.set_enabled(True)
         self.reference.set_enabled(True)
         self.app.refresh_status()
 
     def on_cancel_requested(self) -> None:
-        self.progress_label.configure(text="cancelling...")
+        self.progress_label.setText("cancelling...")
 
-    def handle_event(self, kind: str, *payload) -> None:
-        if kind == "log":
-            message = payload[0]
-            tag = payload[1] if len(payload) > 1 else None
-            self.log.append(message, tag)
-        elif kind == "phase":
-            self.progress_label.configure(text=payload[0])
-            self.progress.configure(value=0)
-        elif kind == "progress":
-            done, total = payload[0], payload[1]
-            self.progress.configure(value=(done / total * 100) if total else 0)
-            if total:
-                self.progress_label.configure(text=f"{done:,}/{total:,}")
-        elif kind == "results":
-            self._show_pairs(payload[0])
-        elif kind == "error":
-            self.log.append(payload[0], "error")
-            messagebox.showerror(APP_TITLE, payload[0])
+    def _handle_log(self, message: str, level: str) -> None:
+        self.log.append(message, level)
+
+    def _handle_progress(self, done: int, total: int, name: str) -> None:
+        self.progress.setValue(int(done / total * 100) if total else 0)
+        self.progress_label.setText(f"{done:,}/{total:,}" if total else "")
+
+    def _handle_phase(self, text: str) -> None:
+        self.progress_label.setText(text)
+        self.progress.setValue(0)
+
+    def _handle_results(self, payload) -> None:
+        self._show_pairs(payload)
 
     def _show_pairs(self, pairs: list) -> None:
         self._pairs = pairs
-        self.results.delete(*self.results.get_children())
-        for index, pair in enumerate(pairs):
-            self.results.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=(
-                    f"{pair.similarity * 100:.1f}%",
-                    pair.filename_a,
-                    pair.kbps_a,
-                    pair.filename_b,
-                    pair.kbps_b,
-                ),
-            )
-        self.export_button.configure(state="normal" if pairs else "disabled")
+        self.results.setRowCount(len(pairs))
+        for row, pair in enumerate(pairs):
+            self.results.setItem(row, 0, QTableWidgetItem(f"{pair.similarity * 100:.1f}%"))
+            self.results.setItem(row, 1, QTableWidgetItem(pair.filename_a))
+            self.results.setItem(row, 2, QTableWidgetItem(str(pair.kbps_a)))
+            self.results.setItem(row, 3, QTableWidgetItem(pair.filename_b))
+            self.results.setItem(row, 4, QTableWidgetItem(str(pair.kbps_b)))
+        self.export_button.setEnabled(bool(pairs))
 
 
-class App(_RootBase):
+class App(QMainWindow):
     """The main window: header, notebook, status bar."""
 
     def __init__(self, initial_paths: list[str] | None = None) -> None:
@@ -795,99 +800,90 @@ class App(_RootBase):
         self.paths = AppPaths.default().ensure()
         self.settings = Settings.load(self.paths.settings_file)
 
-        self.title(f"{APP_TITLE} {__version__}")
-        self.geometry("1060x800")
-        self.minsize(860, 620)
+        self.setWindowTitle(f"{APP_TITLE} {__version__}")
+        self.resize(1060, 800)
+        self.setMinimumSize(860, 620)
 
         icon = _asset("icon.ico")
         if icon is not None:
-            try:
-                self.iconbitmap(str(icon))
-            except tk.TclError:
-                pass
+            self.setWindowIcon(QIcon(str(icon)))
 
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 10, 12, 6)
+        root.setSpacing(6)
 
-        header = ttk.Frame(self, padding=(12, 10, 12, 4))
-        header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="Seas Audio Tools", font=("Segoe UI", 14, "bold")).pack(
-            side="left"
-        )
-        ttk.Label(
-            header, text="drop folders in, pick a tool", foreground=COLOUR_MUTED
-        ).pack(side="left", padx=(10, 0), pady=(4, 0))
+        header = QWidget()
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(10)
+        title = QLabel("Seas Audio Tools")
+        title.setStyleSheet("font-weight: bold; font-size: 14pt;")
+        subtitle = QLabel("drop folders in, pick a tool")
+        subtitle.setStyleSheet(f"color: {COLOUR_MUTED};")
+        header_row.addWidget(title)
+        header_row.addWidget(subtitle, alignment=Qt.AlignmentFlag.AlignBottom)
+        header_row.addStretch(1)
+        root.addWidget(header)
 
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 6))
+        self.tabs = QTabWidget()
+        self.sanitize_tab = SanitizeTab(self)
+        self.duplicates_tab = DuplicatesTab(self)
+        self.tabs.addTab(self.sanitize_tab, "Sanitize tags")
+        self.tabs.addTab(self.duplicates_tab, "Find duplicates")
+        root.addWidget(self.tabs, 1)
 
-        self.sanitize_tab = SanitizeTab(notebook, self)
-        self.duplicates_tab = DuplicatesTab(notebook, self)
-        notebook.add(self.sanitize_tab, text="  Sanitize tags  ")
-        notebook.add(self.duplicates_tab, text="  Find duplicates  ")
+        self.status = QLabel("")
+        self.status.setStyleSheet(f"color: {COLOUR_MUTED}; padding: 4px;")
+        root.addWidget(self.status)
 
-        self.status = ttk.Label(
-            self, text="", anchor="w", foreground=COLOUR_MUTED, padding=(12, 4)
-        )
-        self.status.grid(row=2, column=0, sticky="ew")
+        self._apply_initial_paths(initial_paths)
+        QTimer.singleShot(120, self.refresh_status)
 
+    def _apply_initial_paths(self, initial_paths: list[str] | None) -> None:
         if initial_paths:
             self.sanitize_tab.drop.add_paths(initial_paths)
             self.duplicates_tab.primary.add_paths(initial_paths)
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(120, self.refresh_status)
+        elif self.settings.library_paths:
+            # Restore the library remembered from the previous session.
+            self.duplicates_tab.primary.add_paths(self.settings.library_paths)
 
     def refresh_status(self) -> None:
         status = probe()
         if status.lower().startswith("fpcalc version"):
-            self.status.configure(
-                text=(
-                    f"{status.splitlines()[0]}  |  cache: {self.paths.cache_dir}"
-                    f"  |  drag-drop: {'on' if DND_AVAILABLE else 'off'}"
-                ),
-                foreground=COLOUR_MUTED,
+            self.status.setStyleSheet(f"color: {COLOUR_MUTED}; padding: 4px;")
+            self.status.setText(
+                f"{status.splitlines()[0]}  |  cache: {self.paths.cache_dir}"
             )
         else:
-            self.status.configure(text=f"fpcalc problem: {status}", foreground=COLOUR_ERROR)
+            self.status.setStyleSheet(f"color: {COLOUR_ERROR}; padding: 4px;")
+            self.status.setText(f"fpcalc problem: {status}")
 
-    def _on_close(self) -> None:
-        self.settings.library_paths = [
-            str(path) for path in self.duplicates_tab.primary.paths
-        ]
+    def closeEvent(self, event) -> None:
+        self.settings.library_paths = [str(path) for path in self.duplicates_tab.primary.paths]
         try:
             self.settings.save(self.paths.settings_file)
         except OSError:
             pass
-        self.destroy()
+        self.sanitize_tab.shutdown()
+        self.duplicates_tab.shutdown()
+        event.accept()
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``seas-audio gui`` and the ``seas-audio-gui`` script."""
-    if os.name == "nt":
-        try:  # crisp text on high-DPI displays
-            from ctypes import windll
-
-            windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
-
     arguments = list(sys.argv[1:] if argv is None else argv)
     initial = [item for item in arguments if not item.startswith("-")]
 
-    app = App(initial_paths=initial)
-    if not DND_AVAILABLE:
-        app.after(
-            400,
-            lambda: messagebox.showwarning(
-                APP_TITLE,
-                "tkinterdnd2 is not installed, so drag and drop is disabled.\n"
-                "Install it with:  python -m pip install tkinterdnd2\n"
-                "The Browse... buttons still work.",
-            ),
-        )
-    app.mainloop()
-    return 0
+    qt_args = [sys.argv[0]] + arguments
+    app = QApplication.instance() or QApplication(qt_args)
+    app.setApplicationName("seas-audio-tools")
+    app.setApplicationDisplayName(APP_TITLE)
+
+    window = App(initial_paths=initial)
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":

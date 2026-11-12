@@ -99,7 +99,7 @@ attaches the zip to the GitHub release.
 bin/fpcalc.exe          Chromaprint binary (v1.6.1)
 src/seas_audio/core     scanner, fpcalc wrapper, cache, settings
 src/seas_audio/tools    sanitizer + duplicates (no cross-imports)
-src/seas_audio/ui       Tkinter shell with tkinterdnd2 drop targets
+src/seas_audio/ui       PySide6 (Qt) shell with native drag-and-drop
 tests                   unittest suites, runnable with pytest
 build                   PyInstaller spec
 ```

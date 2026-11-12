@@ -16,10 +16,10 @@ reproduced or referenced here to satisfy their distribution terms.
 | NumPy | 2.0+ | BSD-3-Clause (plus bundled 0BSD, MIT, Zlib, CC0-1.0) | https://numpy.org/ |
 | Pillow | 10+ | MIT-CMU | https://python-pillow.org/ |
 | tqdm | 4.66+ | MPL-2.0 AND MIT | https://tqdm.github.io/ |
-| tkinterdnd2 | 0.4+ | MIT | https://github.com/Eliav2/tkinterdnd2 |
+| PySide6 (Qt for Python) | 6.6+ | LGPL-3.0 | https://doc.qt.io/qtforpython/ |
 | Python | 3.11+ | PSF-2.0 | https://www.python.org/ |
 
-`mutagen`, `NumPy`, `Pillow`, `tqdm` and `tkinterdnd2` are imported into the
+`mutagen`, `NumPy`, `Pillow`, `tqdm` and `PySide6` are imported into the
 same process as this application. Their licence texts are shipped inside the
 release folder under `_internal/*.dist-info/`.
 
@@ -49,11 +49,13 @@ The distributed `fpcalc.exe` build links FFmpeg libraries
 * **Project:** https://ffmpeg.org/
 * **Source:** https://ffmpeg.org/download.html
 
-## Runtime dependencies on Tcl/Tk
+## Runtime dependencies on Qt
 
-The graphical interface uses Tk, distributed with Python under the Tcl/Tk
-licence. Drag and drop is provided by the bundled `tkdnd` Tcl extension
-(BSD-style licence), shipped inside `tkinterdnd2`.
+The graphical interface uses Qt via the PySide6 bindings. Qt is distributed
+under the LGPL-3.0 (and, optionally, a commercial licence); the application
+links it dynamically, so the LGPL's relinking provisions are satisfied. Drag
+and drop is provided natively by Qt itself - no third-party drop extension is
+required.
 
 ## Licence texts
 
