@@ -22,8 +22,8 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtCore import QEvent, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,20 +65,61 @@ from seas_audio.tools import duplicates, sanitizer
 
 MAX_LOG_LINES = 3000
 
-COLOUR_DROP = "#f4f7fb"
-COLOUR_DROP_ACTIVE = "#dbe9ff"
-COLOUR_BORDER = "#b8c4d6"
-COLOUR_BORDER_ACTIVE = "#4a86e8"
-COLOUR_TEXT = "#22303f"
-COLOUR_MUTED = "#5a6b7d"
-COLOUR_ERROR = "#b3261e"
-COLOUR_OK = "#1b6b35"
-
-_LEVEL_COLOURS = {
-    "error": COLOUR_ERROR,
-    "ok": COLOUR_OK,
-    "muted": COLOUR_MUTED,
+# Light-theme colours, preserved from the original Tk design. In dark mode the
+# neutral surfaces (log box, drop area) come from Qt's palette instead, so the
+# app follows the OS theme rather than pinning a bright background.
+_LIGHT = {
+    "text": "#22303f",
+    "muted": "#5a6b7d",
+    "error": "#b3261e",
+    "ok": "#1b6b35",
+    "drop_bg": "#f4f7fb",
+    "drop_active": "#dbe9ff",
+    "border": "#b8c4d6",
+    "border_active": "#4a86e8",
 }
+
+# Semantic accent colours tuned for a dark surface (brighter so they stay legible).
+_DARK_ACCENTS = {
+    "muted": "#9aa7b4",
+    "error": "#ff6b6b",
+    "ok": "#63d48f",
+}
+
+
+def _blend(a: QColor, b: QColor, t: float) -> QColor:
+    """Linearly blend two colours; ``t`` is the weight of ``b`` (0..1)."""
+    return QColor(
+        int(a.red() + (b.red() - a.red()) * t),
+        int(a.green() + (b.green() - a.green()) * t),
+        int(a.blue() + (b.blue() - a.blue()) * t),
+    )
+
+
+def _is_dark(palette: QPalette) -> bool:
+    return palette.color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def _theme_colors(palette: QPalette) -> dict[str, QColor]:
+    """Resolve the colour roles the app draws itself, for the current theme."""
+    if _is_dark(palette):
+        alternate = palette.color(QPalette.ColorRole.AlternateBase)
+        highlight = palette.color(QPalette.ColorRole.Highlight)
+        return {
+            "text": palette.color(QPalette.ColorRole.Text),
+            "muted": QColor(_DARK_ACCENTS["muted"]),
+            "error": QColor(_DARK_ACCENTS["error"]),
+            "ok": QColor(_DARK_ACCENTS["ok"]),
+            "drop_bg": alternate,
+            "drop_active": _blend(alternate, highlight, 0.30),
+            "border": palette.color(QPalette.ColorRole.Mid),
+            "border_active": highlight,
+        }
+    return {key: QColor(value) for key, value in _LIGHT.items()}
+
+
+def _muted_css(palette: QPalette) -> str:
+    return f"color: {_theme_colors(palette)['muted'].name()};"
 
 
 def _asset(name: str) -> Path | None:
@@ -122,18 +163,22 @@ class LogPane(QTextEdit):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setAcceptRichText(False)
-        self.setStyleSheet(
-            f"background: #fbfcfd; color: {COLOUR_TEXT}; border: 1px solid {COLOUR_BORDER};"
-        )
+        self._theme = _theme_colors(self.palette())
 
     def append(self, message: str, level: str | None = None) -> None:
-        self.setTextColor(QColor(_LEVEL_COLOURS.get(level or "", COLOUR_TEXT)))
+        colour = self._theme.get(level, self._theme["text"])
+        self.setTextColor(colour)
         super().append(message)
-        self.setTextColor(QColor(COLOUR_TEXT))
+        self.setTextColor(self._theme["text"])
         self._trim()
 
     def clear(self) -> None:
         super().clear()
+
+    def changeEvent(self, event) -> None:
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self._theme = _theme_colors(self.palette())
+        super().changeEvent(event)
 
     def _trim(self) -> None:
         document = self.document()
@@ -197,19 +242,26 @@ class DropZone(QWidget):
         layout.addWidget(buttons)
 
         self._hint = QLabel(hint)
-        self._hint.setStyleSheet(f"color: {COLOUR_MUTED};")
+        self._hint.setStyleSheet(_muted_css(self.palette()))
         layout.addWidget(self._hint)
 
         self.setAcceptDrops(True)
         self._refresh()
 
     def _paint(self, *, active: bool) -> None:
-        background = COLOUR_DROP_ACTIVE if active else COLOUR_DROP
-        border = COLOUR_BORDER_ACTIVE if active else COLOUR_BORDER
+        theme = _theme_colors(self.palette())
+        background = theme["drop_active"] if active else theme["drop_bg"]
+        border = theme["border_active"] if active else theme["border"]
         self._target.setStyleSheet(
-            f"background: {background}; color: {COLOUR_MUTED};"
-            f" border: 1px solid {border}; padding: 12px;"
+            f"background: {background.name()}; color: {theme['muted'].name()};"
+            f" border: 1px solid {border.name()}; padding: 12px;"
         )
+
+    def changeEvent(self, event) -> None:
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self._paint(active=False)
+            self._hint.setStyleSheet(_muted_css(self.palette()))
+        super().changeEvent(event)
 
     @property
     def paths(self) -> list[Path]:
@@ -426,7 +478,7 @@ class SanitizeTab(JobTab):
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
         self.progress_label = QLabel("idle")
-        self.progress_label.setStyleSheet(f"color: {COLOUR_MUTED};")
+        self.progress_label.setStyleSheet(_muted_css(self.palette()))
         self.run_button.clicked.connect(self.run)
         self.cancel_button.clicked.connect(self.request_cancel)
         ctrl.addWidget(self.run_button)
@@ -503,6 +555,11 @@ class SanitizeTab(JobTab):
         self.progress_label.setText("finished")
         self.app.refresh_status()
 
+    def changeEvent(self, event) -> None:
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self.progress_label.setStyleSheet(_muted_css(self.palette()))
+        super().changeEvent(event)
+
     def on_cancel_requested(self) -> None:
         self.progress_label.setText("cancelling...")
 
@@ -576,7 +633,7 @@ class DuplicatesTab(JobTab):
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
         self.progress_label = QLabel("idle")
-        self.progress_label.setStyleSheet(f"color: {COLOUR_MUTED};")
+        self.progress_label.setStyleSheet(_muted_css(self.palette()))
         self.run_button.clicked.connect(self.run)
         self.cancel_button.clicked.connect(self.request_cancel)
         self.export_button.clicked.connect(self.export_csv)
@@ -763,6 +820,11 @@ class DuplicatesTab(JobTab):
         self.reference.set_enabled(True)
         self.app.refresh_status()
 
+    def changeEvent(self, event) -> None:
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self.progress_label.setStyleSheet(_muted_css(self.palette()))
+        super().changeEvent(event)
+
     def on_cancel_requested(self) -> None:
         self.progress_label.setText("cancelling...")
 
@@ -821,7 +883,8 @@ class App(QMainWindow):
         title = QLabel("Seas Audio Tools")
         title.setStyleSheet("font-weight: bold; font-size: 14pt;")
         subtitle = QLabel("drop folders in, pick a tool")
-        subtitle.setStyleSheet(f"color: {COLOUR_MUTED};")
+        subtitle.setStyleSheet(_muted_css(self.palette()))
+        self._subtitle = subtitle
         header_row.addWidget(title)
         header_row.addWidget(subtitle, alignment=Qt.AlignmentFlag.AlignBottom)
         header_row.addStretch(1)
@@ -835,7 +898,8 @@ class App(QMainWindow):
         root.addWidget(self.tabs, 1)
 
         self.status = QLabel("")
-        self.status.setStyleSheet(f"color: {COLOUR_MUTED}; padding: 4px;")
+        self._status_error = False
+        self._apply_status_style()
         root.addWidget(self.status)
 
         self._apply_initial_paths(initial_paths)
@@ -849,16 +913,27 @@ class App(QMainWindow):
             # Restore the library remembered from the previous session.
             self.duplicates_tab.primary.add_paths(self.settings.library_paths)
 
+    def _apply_status_style(self) -> None:
+        theme = _theme_colors(self.palette())
+        colour = theme["error"] if self._status_error else theme["muted"]
+        self._subtitle.setStyleSheet(f"color: {theme['muted'].name()};")
+        self.status.setStyleSheet(f"color: {colour.name()}; padding: 4px;")
+
     def refresh_status(self) -> None:
         status = probe()
-        if status.lower().startswith("fpcalc version"):
-            self.status.setStyleSheet(f"color: {COLOUR_MUTED}; padding: 4px;")
+        self._status_error = not status.lower().startswith("fpcalc version")
+        self._apply_status_style()
+        if self._status_error:
+            self.status.setText(f"fpcalc problem: {status}")
+        else:
             self.status.setText(
                 f"{status.splitlines()[0]}  |  cache: {self.paths.cache_dir}"
             )
-        else:
-            self.status.setStyleSheet(f"color: {COLOUR_ERROR}; padding: 4px;")
-            self.status.setText(f"fpcalc problem: {status}")
+
+    def changeEvent(self, event) -> None:
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self._apply_status_style()
+        super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
         self.settings.library_paths = [str(path) for path in self.duplicates_tab.primary.paths]
