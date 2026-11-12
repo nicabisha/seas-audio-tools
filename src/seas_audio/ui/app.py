@@ -79,11 +79,14 @@ _LIGHT = {
     "border_active": "#4a86e8",
 }
 
-# Semantic accent colours tuned for a dark surface (brighter so they stay legible).
-_DARK_ACCENTS = {
+# Dark-theme colours, hand-tuned so the app's own surfaces are predictable.
+# Qt's Windows dark palette does not reliably set AlternateBase/Mid, so we avoid
+# those roles and derive surfaces from Base/Text/Highlight instead.
+_DARK = {
     "muted": "#9aa7b4",
     "error": "#ff6b6b",
     "ok": "#63d48f",
+    "border": "#4a4a4a",
 }
 
 
@@ -102,20 +105,32 @@ def _is_dark(palette: QPalette) -> bool:
 
 def _theme_colors(palette: QPalette) -> dict[str, QColor]:
     """Resolve the colour roles the app draws itself, for the current theme."""
+    base = palette.color(QPalette.ColorRole.Base)
     if _is_dark(palette):
-        alternate = palette.color(QPalette.ColorRole.AlternateBase)
+        text = palette.color(QPalette.ColorRole.Text)
         highlight = palette.color(QPalette.ColorRole.Highlight)
+        drop_bg = _blend(base, text, 0.08)  # subtly raised above the window
         return {
-            "text": palette.color(QPalette.ColorRole.Text),
-            "muted": QColor(_DARK_ACCENTS["muted"]),
-            "error": QColor(_DARK_ACCENTS["error"]),
-            "ok": QColor(_DARK_ACCENTS["ok"]),
-            "drop_bg": alternate,
-            "drop_active": _blend(alternate, highlight, 0.30),
-            "border": palette.color(QPalette.ColorRole.Mid),
+            "text": text,
+            "muted": QColor(_DARK["muted"]),
+            "error": QColor(_DARK["error"]),
+            "ok": QColor(_DARK["ok"]),
+            "drop_bg": drop_bg,
+            "drop_active": _blend(drop_bg, highlight, 0.30),
+            "border": QColor(_DARK["border"]),
             "border_active": highlight,
         }
     return {key: QColor(value) for key, value in _LIGHT.items()}
+
+
+def _box_css(palette: QPalette) -> str:
+    """Visible border for the list and log boxes.
+
+    Only the border is styled; background and text stay native so they follow
+    the palette, and a border-only stylesheet doesn't touch the palette (which
+    would otherwise re-trigger changeEvent in a loop).
+    """
+    return f"border: 1px solid {_theme_colors(palette)['border'].name()};"
 
 
 def _muted_css(palette: QPalette) -> str:
@@ -157,13 +172,13 @@ def _reveal_in_explorer(path: str) -> None:
 
 
 class LogPane(QTextEdit):
-    """Read-only scrolling log with colour-coded lines."""
+    """Read-only scrolling log with colour-coded lines and a visible border."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setReadOnly(True)
         self.setAcceptRichText(False)
-        self._theme = _theme_colors(self.palette())
+        self._restyle()
 
     def append(self, message: str, level: str | None = None) -> None:
         colour = self._theme.get(level, self._theme["text"])
@@ -175,9 +190,13 @@ class LogPane(QTextEdit):
     def clear(self) -> None:
         super().clear()
 
+    def _restyle(self) -> None:
+        self._theme = _theme_colors(self.palette())
+        self.setStyleSheet(_box_css(self.palette()))
+
     def changeEvent(self, event) -> None:
         if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
-            self._theme = _theme_colors(self.palette())
+            self._restyle()
         super().changeEvent(event)
 
     def _trim(self) -> None:
@@ -223,6 +242,7 @@ class DropZone(QWidget):
 
         self._listbox = QListWidget()
         self._listbox.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._listbox.setStyleSheet(_box_css(self.palette()))
         layout.addWidget(self._listbox, 1)
 
         buttons = QWidget()
@@ -260,6 +280,7 @@ class DropZone(QWidget):
     def changeEvent(self, event) -> None:
         if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
             self._paint(active=False)
+            self._listbox.setStyleSheet(_box_css(self.palette()))
             self._hint.setStyleSheet(_muted_css(self.palette()))
         super().changeEvent(event)
 
