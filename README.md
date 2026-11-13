@@ -17,7 +17,7 @@ Drop a file or folder onto the window, pick a tab, press Run.
 
 No installer, no Python, no admin rights.
 
-1. Download **`SeasAudioTools-1.0.0-win64.zip`** from the
+1. Download **`SeasAudioTools-1.1.0-win64.zip`** from the
    [latest release](https://github.com/nicholasabisha/seas-audio-tools/releases/latest).
 2. Extract it anywhere, e.g. `D:\Tools\SeasAudioTools`.
 3. Run **`SeasAudioTools.exe`**.
@@ -83,7 +83,7 @@ python -m pytest tests  # 65 tests
 
 ```powershell
 python -m PyInstaller build\seas-audio.spec --noconfirm --distpath build\dist --workpath build\work
-python build\make_release.py --version v1.0.0
+python build\make_release.py --version v1.1.0
 ```
 
 Output: `build\dist\SeasAudioTools\`. The second command stages that folder with
