@@ -76,7 +76,7 @@ cd seas-audio-tools
 python -m pip install -e ".[dev,build]"
 
 seas-audio-gui          # the window
-python -m pytest tests  # 53 tests
+python -m pytest tests  # 65 tests
 ```
 
 ## Building the portable release

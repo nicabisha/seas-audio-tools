@@ -20,10 +20,11 @@ import os
 import subprocess
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPalette
+from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,28 +66,23 @@ from seas_audio.tools import duplicates, sanitizer
 
 MAX_LOG_LINES = 3000
 
-# Light-theme colours, preserved from the original Tk design. In dark mode the
-# neutral surfaces (log box, drop area) come from Qt's palette instead, so the
-# app follows the OS theme rather than pinning a bright background.
+# Semantic accent colours, preserved from the original Tk design and tuned per
+# theme so they stay legible on the matching surface. Everything else - text,
+# borders, the drag highlight, dark drop surfaces - is derived from the palette
+# so the app's own chrome matches native widgets in either theme.
 _LIGHT = {
-    "text": "#22303f",
     "muted": "#5a6b7d",
     "error": "#b3261e",
     "ok": "#1b6b35",
     "drop_bg": "#f4f7fb",
-    "drop_active": "#dbe9ff",
-    "border": "#b8c4d6",
-    "border_active": "#4a86e8",
 }
 
-# Dark-theme colours, hand-tuned so the app's own surfaces are predictable.
 # Qt's Windows dark palette does not reliably set AlternateBase/Mid, so we avoid
 # those roles and derive surfaces from Base/Text/Highlight instead.
 _DARK = {
     "muted": "#9aa7b4",
     "error": "#ff6b6b",
     "ok": "#63d48f",
-    "border": "#4a4a4a",
 }
 
 
@@ -106,21 +102,28 @@ def _is_dark(palette: QPalette) -> bool:
 def _theme_colors(palette: QPalette) -> dict[str, QColor]:
     """Resolve the colour roles the app draws itself, for the current theme."""
     base = palette.color(QPalette.ColorRole.Base)
+    text = palette.color(QPalette.ColorRole.Text)
+    highlight = palette.color(QPalette.ColorRole.Highlight)
     if _is_dark(palette):
-        text = palette.color(QPalette.ColorRole.Text)
-        highlight = palette.color(QPalette.ColorRole.Highlight)
+        accents = _DARK
         drop_bg = _blend(base, text, 0.08)  # subtly raised above the window
-        return {
-            "text": text,
-            "muted": QColor(_DARK["muted"]),
-            "error": QColor(_DARK["error"]),
-            "ok": QColor(_DARK["ok"]),
-            "drop_bg": drop_bg,
-            "drop_active": _blend(drop_bg, highlight, 0.30),
-            "border": QColor(_DARK["border"]),
-            "border_active": highlight,
-        }
-    return {key: QColor(value) for key, value in _LIGHT.items()}
+        drop_tint = 0.30
+    else:
+        accents = _LIGHT
+        drop_bg = QColor(_LIGHT["drop_bg"])
+        drop_tint = 0.25
+    return {
+        "text": text,
+        "muted": QColor(accents["muted"]),
+        "error": QColor(accents["error"]),
+        "ok": QColor(accents["ok"]),
+        "drop_bg": drop_bg,
+        "drop_active": _blend(drop_bg, highlight, drop_tint),
+        # Derive the border the same way in both themes so it keeps a matching
+        # hue (and weight) instead of flipping between blue-grey and neutral.
+        "border": _blend(base, text, 0.22),
+        "border_active": highlight,
+    }
 
 
 def _box_css(palette: QPalette) -> str:
@@ -135,6 +138,22 @@ def _box_css(palette: QPalette) -> str:
 
 def _muted_css(palette: QPalette) -> str:
     return f"color: {_theme_colors(palette)['muted'].name()};"
+
+
+def _table_css(palette: QPalette) -> str:
+    """Border, grid and alternate-row colours for the results table.
+
+    ``alternate-background-color`` is set explicitly: Qt's dark palette leaves
+    ``AlternateBase`` at a light default, so alternating rows would otherwise
+    stay near-white while the item text turns light.
+    """
+    base = palette.color(QPalette.ColorRole.Base)
+    text = palette.color(QPalette.ColorRole.Text)
+    return (
+        f"QTableWidget {{ border: 1px solid {_theme_colors(palette)['border'].name()};"
+        f" alternate-background-color: {_blend(base, text, 0.06).name()};"
+        f" gridline-color: {_blend(base, text, 0.14).name()}; }}"
+    )
 
 
 def _asset(name: str) -> Path | None:
@@ -172,27 +191,66 @@ def _reveal_in_explorer(path: str) -> None:
 
 
 class LogPane(QTextEdit):
-    """Read-only scrolling log with colour-coded lines and a visible border."""
+    """Read-only scrolling log with colour-coded lines and a visible border.
+
+    The text and its level are kept in ``_lines`` so the document can be
+    rebuilt when the palette changes: colours written with the old theme would
+    otherwise stay behind and become unreadable against the new background.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setReadOnly(True)
         self.setAcceptRichText(False)
+        self._lines: deque[tuple[str, str | None]] = deque(maxlen=MAX_LOG_LINES)
         self._restyle()
 
     def append(self, message: str, level: str | None = None) -> None:
-        colour = self._theme.get(level, self._theme["text"])
-        self.setTextColor(colour)
-        super().append(message)
-        self.setTextColor(self._theme["text"])
+        self._lines.append((message, level))
+        follow = self._at_bottom()
+        # Insert through a private cursor with an explicit format. setTextColor()
+        # would mutate the current char format and repaint any active selection.
+        self._insert(message, level, new_block=not self.document().isEmpty())
         self._trim()
+        if follow:
+            self._scroll_to_bottom()
 
     def clear(self) -> None:
+        self._lines.clear()
         super().clear()
+
+    def _format(self, level: str | None) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setForeground(self._theme.get(level, self._theme["text"]))
+        return fmt
+
+    def _insert(self, message: str, level: str | None, *, new_block: bool) -> None:
+        cursor = QTextCursor(self.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if new_block:
+            cursor.insertBlock()
+        cursor.insertText(message, self._format(level))
+
+    def _rebuild(self) -> None:
+        bar = self.verticalScrollBar()
+        position = bar.value()
+        self.document().clear()
+        for index, (message, level) in enumerate(self._lines):
+            self._insert(message, level, new_block=index > 0)
+        bar.setValue(min(position, bar.maximum()))
+
+    def _at_bottom(self) -> bool:
+        bar = self.verticalScrollBar()
+        return bar.value() >= bar.maximum()
+
+    def _scroll_to_bottom(self) -> None:
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _restyle(self) -> None:
         self._theme = _theme_colors(self.palette())
         self.setStyleSheet(_box_css(self.palette()))
+        self._rebuild()
 
     def changeEvent(self, event) -> None:
         if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
@@ -202,10 +260,7 @@ class LogPane(QTextEdit):
     def _trim(self) -> None:
         document = self.document()
         while document.blockCount() > MAX_LOG_LINES:
-            from PySide6.QtGui import QTextCursor
-
-            block = document.firstBlock()
-            cursor = QTextCursor(block)
+            cursor = QTextCursor(document.firstBlock())
             cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()
@@ -237,6 +292,8 @@ class DropZone(QWidget):
         self._target.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._target.setMinimumHeight(56)
         self._target.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._target.setToolTip("Drop files or folders, or click to browse")
+        self._target.installEventFilter(self)
         self._paint(active=False)
         layout.addWidget(self._target)
 
@@ -272,10 +329,24 @@ class DropZone(QWidget):
         theme = _theme_colors(self.palette())
         background = theme["drop_active"] if active else theme["drop_bg"]
         border = theme["border_active"] if active else theme["border"]
+        # Keep full-contrast text while a drag is over the zone; the muted tone
+        # is too faint on the active surface in dark mode.
+        colour = theme["text"] if active else theme["muted"]
         self._target.setStyleSheet(
-            f"background: {background.name()}; color: {theme['muted'].name()};"
+            f"background: {background.name()}; color: {colour.name()};"
             f" border: 1px solid {border.name()}; padding: 12px;"
         )
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            watched is self._target
+            and self._enabled
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.browse()
+            return True
+        return super().eventFilter(watched, event)
 
     def changeEvent(self, event) -> None:
         if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
@@ -431,6 +502,9 @@ class JobTab(QWidget):
         thread.results.connect(self._handle_results)
         thread.failed.connect(self._handle_error)
         thread.done.connect(self._handle_done)
+        # Delete only once the thread has actually stopped; deleting on ``done``
+        # races the still-running run() and Qt aborts on a live QThread.
+        thread.finished.connect(thread.deleteLater)
         self._thread = thread
         self.on_job_start()
         thread.start()
@@ -441,9 +515,16 @@ class JobTab(QWidget):
         self.on_cancel_requested()
 
     def shutdown(self) -> None:
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.request_cancel()
-            self._thread.wait(1500)
+        """Cancel and join the worker so closing cannot destroy a live QThread.
+
+        ``wait()`` is intentionally unbounded: fpcalc calls finish or hit their
+        own timeout, and returning while the thread still runs aborts the
+        process when Qt tears the QThread down.
+        """
+        thread = self._thread
+        if thread is not None and thread.isRunning():
+            thread.request_cancel()
+            thread.wait()
 
     # --- hooks (overridden per tab) ---
     def on_job_start(self) -> None: ...
@@ -459,10 +540,7 @@ class JobTab(QWidget):
         QMessageBox.critical(self, APP_TITLE, message)
 
     def _handle_done(self) -> None:
-        thread = self._thread
         self._thread = None
-        if thread is not None:
-            thread.deleteLater()
         self.on_job_finish()
 
 
@@ -555,9 +633,16 @@ class SanitizeTab(JobTab):
 
         if job.is_cancelled():
             job.log.emit("Cancelled - stopped early.", "error")
+        errors = counts.get(sanitizer.STATUS_ERROR, 0)
+        if errors and errors == len(results):
+            summary_level = "error"
+        elif errors:
+            summary_level = "normal"
+        else:
+            summary_level = "ok"
         job.log.emit(
             "Summary: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())),
-            "ok",
+            summary_level,
         )
         if dry_run:
             job.log.emit("Dry run - no files were modified.", "muted")
@@ -677,6 +762,7 @@ class DuplicatesTab(JobTab):
         self.results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results.setAlternatingRowColors(True)
+        self.results.setStyleSheet(_table_css(self.palette()))
         self.results.verticalHeader().setVisible(False)
         self.results.cellDoubleClicked.connect(self._reveal_selected)
         layout.addWidget(self.results, 2)
@@ -839,11 +925,13 @@ class DuplicatesTab(JobTab):
         self.cancel_button.setEnabled(False)
         self.primary.set_enabled(True)
         self.reference.set_enabled(True)
+        self.progress_label.setText("finished")
         self.app.refresh_status()
 
     def changeEvent(self, event) -> None:
         if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
             self.progress_label.setStyleSheet(_muted_css(self.palette()))
+            self.results.setStyleSheet(_table_css(self.palette()))
         super().changeEvent(event)
 
     def on_cancel_requested(self) -> None:
@@ -875,6 +963,12 @@ class DuplicatesTab(JobTab):
         self.export_button.setEnabled(bool(pairs))
 
 
+class _StatusProbe(QObject):
+    """Relay an ``fpcalc -version`` probe from a worker thread to the UI."""
+
+    done = Signal(str)
+
+
 class App(QMainWindow):
     """The main window: header, notebook, status bar."""
 
@@ -882,6 +976,9 @@ class App(QMainWindow):
         super().__init__()
         self.paths = AppPaths.default().ensure()
         self.settings = Settings.load(self.paths.settings_file)
+        self._probe_bridge = _StatusProbe(self)
+        self._probe_bridge.done.connect(self._apply_status)
+        self._probing = False
 
         self.setWindowTitle(f"{APP_TITLE} {__version__}")
         self.resize(1060, 800)
@@ -941,7 +1038,28 @@ class App(QMainWindow):
         self.status.setStyleSheet(f"color: {colour.name()}; padding: 4px;")
 
     def refresh_status(self) -> None:
-        status = probe()
+        """Probe fpcalc off the UI thread so a slow binary never freezes the window."""
+        if self._probing:
+            return
+        self._probing = True
+        if not self.status.text():
+            self.status.setText("checking fpcalc...")
+        bridge = self._probe_bridge
+
+        def work() -> None:
+            try:
+                result = probe()
+            except Exception as exc:  # pragma: no cover - probe is documented not to raise
+                result = f"probe failed: {exc}"
+            try:
+                bridge.done.emit(result)
+            except RuntimeError:  # window already gone
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_status(self, status: str) -> None:
+        self._probing = False
         self._status_error = not status.lower().startswith("fpcalc version")
         self._apply_status_style()
         if self._status_error:
