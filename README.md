@@ -1,6 +1,6 @@
 # Seas Audio Tools
 
-[![CI](https://github.com/nicholasabisha/seas-audio-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/nicholasabisha/seas-audio-tools/actions/workflows/ci.yml)
+[![CI](https://github.com/nicabisha/seas-audio-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/nicabisha/seas-audio-tools/actions/workflows/ci.yml)
 
 A drag-and-drop Windows app for two music-library chores:
 
@@ -18,7 +18,7 @@ Drop a file or folder onto the window, pick a tab, press Run.
 No installer, no Python, no admin rights.
 
 1. Download **`SeasAudioTools-1.1.0-win64.zip`** from the
-   [latest release](https://github.com/nicholasabisha/seas-audio-tools/releases/latest).
+   [latest release](https://github.com/nicabisha/seas-audio-tools/releases/latest).
 2. Extract it anywhere, e.g. `D:\Tools\SeasAudioTools`.
 3. Run **`SeasAudioTools.exe`**.
 
@@ -71,7 +71,7 @@ seas-audio cache path
 Requires Python **3.11+**.
 
 ```powershell
-git clone https://github.com/nicholasabisha/seas-audio-tools.git
+git clone https://github.com/nicabisha/seas-audio-tools.git
 cd seas-audio-tools
 python -m pip install -e ".[dev,build]"
 
